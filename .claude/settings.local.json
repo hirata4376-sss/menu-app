@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"/c/Users/heyta/OneDrive/Desktop/作業場/my note/20_Project/Menu_App\" && ls -la)"
+    ]
+  }
+}
