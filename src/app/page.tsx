@@ -105,21 +105,44 @@ export default function Home() {
   const [isEditingShoppingList, setIsEditingShoppingList] = useState(false);
 
   // --- データの取得とリアルタイム購読 ---
-  const fetchMenus = async () => {
+  const fetchMenus = async (): Promise<boolean> => {
     const { data, error } = await supabase
       .from("menus")
       .select("*")
       .order("created_at", { ascending: false });
 
     if (error) {
-      console.error("データの取得に失敗しました:", error);
-      return;
+      console.error("データの取得に失敗しました（localStorageのデータを使用）:", error);
+      return false;
     }
-    if (data) setMenus(data);
+    if (data) {
+      setMenus(data);
+      localStorage.setItem("menus", JSON.stringify(data));
+    }
+    return true;
   };
 
+  // menus が変わるたびに localStorage に保存
   useEffect(() => {
-    fetchMenus().then(() => setIsLoaded(true));
+    if (isLoaded) {
+      localStorage.setItem("menus", JSON.stringify(menus));
+    }
+  }, [menus, isLoaded]);
+
+  useEffect(() => {
+    // まず localStorage から即座に読み込む
+    try {
+      const saved = localStorage.getItem("menus");
+      if (saved) {
+        setMenus(JSON.parse(saved));
+      }
+    } catch {
+      // localStorage が読めない場合は無視
+    }
+    setIsLoaded(true);
+
+    // 次に Supabase から最新データを取得（失敗しても localStorage のデータが残る）
+    fetchMenus();
 
     const channel = supabase
       .channel("realtime-menus")
