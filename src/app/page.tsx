@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { supabase } from "@/utils/supabase";
 
 type Menu = {
@@ -14,17 +14,183 @@ type Menu = {
 type IngredientRow = {
   name: string;
   amount: string;
+  isSeasoning: boolean;
+  /** ユーザーが調味料チェックを手動で操作したか（自動判定の上書きを防ぐ） */
+  touched?: boolean;
 };
 
+// ===================================================================
+// 調味料の判定
+// ===================================================================
+
+/** 保存形式のマーカー。先頭に付いていれば調味料 */
+const SEASONING_PREFIX = "#";
+
+/** 組み込みの調味料辞書（初期チェックのための候補。手で外せる） */
+const SEASONINGS: string[] = [
+  "醤油", "しょうゆ", "しょう油", "濃口醤油", "薄口醤油",
+  "みりん", "味醂", "酒", "料理酒", "日本酒",
+  "砂糖", "上白糖", "きび砂糖", "塩", "こしょう", "胡椒", "黒こしょう", "塩こしょう",
+  "味噌", "みそ", "酢", "米酢", "穀物酢", "ポン酢",
+  "油", "サラダ油", "ごま油", "オリーブオイル", "オリーブ油", "揚げ油",
+  "マヨネーズ", "ケチャップ", "ソース", "中濃ソース", "ウスターソース", "オイスターソース",
+  "めんつゆ", "白だし", "だし", "だし汁", "だしの素", "和風だし", "顆粒だし",
+  "コンソメ", "鶏がらスープの素", "中華スープの素", "ブイヨン",
+  "片栗粉", "小麦粉", "薄力粉", "強力粉", "パン粉",
+  "豆板醤", "甜麺醤", "コチュジャン", "ナンプラー", "カレー粉", "ラー油",
+  "わさび", "からし", "マスタード", "七味唐辛子", "一味唐辛子", "山椒",
+  "ローリエ", "はちみつ", "蜂蜜", "みそだれ", "焼肉のたれ",
+];
+
+// ===================================================================
+// 量のパース（数値＋単位）
+// ===================================================================
+
+type ParsedAmount = { value: number; unit: string };
+
+/** Unicodeの分数記号 */
+const VULGAR_FRACTIONS: Record<string, string> = {
+  "½": "1/2", "⅓": "1/3", "⅔": "2/3", "¼": "1/4", "¾": "3/4", "⅕": "1/5",
+};
+
+/** 単位の表記ゆれを吸収する */
+const UNIT_ALIASES: Record<string, string> = {
+  "グラム": "g", "G": "g", "gr": "g",
+  "キロ": "kg", "キログラム": "kg",
+  "ミリリットル": "ml", "cc": "ml", "CC": "ml", "ML": "ml",
+  "リットル": "L", "l": "L",
+  "コ": "個", "こ": "個", "ケ": "個", "ヶ": "個", "個分": "個",
+  "ホン": "本", "マイ": "枚",
+  "パック分": "パック",
+};
+
+/** 全角英数記号を半角に変換する */
+const toHalfWidth = (s: string): string =>
+  s
+    .replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/　/g, " ");
+
+const normalizeUnit = (u: string): string => {
+  const t = u.trim().replace(/^[のっ・]+/, "").trim();
+  return UNIT_ALIASES[t] ?? t;
+};
+
+/**
+ * 「200g」「1/2個」「1と1/2カップ」などを { 数値, 単位 } に分解する。
+ * 「大さじ1」「少々」「適量」のように数値が取り出せないものは null を返し、
+ * 合計せずそのまま表示する。
+ */
+const parseAmount = (raw: string): ParsedAmount | null => {
+  if (!raw) return null;
+  let s = toHalfWidth(raw).trim();
+  for (const [k, v] of Object.entries(VULGAR_FRACTIONS)) s = s.split(k).join(v);
+  s = s.replace(/^(約|およそ)\s*/, "").trim();
+  if (!s) return null;
+
+  // 「半分」「半量」→ 0.5（単位は同じ食材の他の量から補う）
+  if (/^(半分|半|半量)$/.test(s)) return { value: 0.5, unit: "" };
+
+  let m: RegExpMatchArray | null;
+
+  // 帯分数「1と1/2」「1 1/2」
+  if ((m = s.match(/^(\d+)\s*(?:と|\s+)\s*(\d+)\s*\/\s*(\d+)(.*)$/))) {
+    const d = parseInt(m[3], 10);
+    if (!d) return null;
+    return { value: parseInt(m[1], 10) + parseInt(m[2], 10) / d, unit: normalizeUnit(m[4]) };
+  }
+  // 「2分の1本」
+  if ((m = s.match(/^(\d+)\s*分の\s*(\d+)(.*)$/))) {
+    const d = parseInt(m[1], 10);
+    if (!d) return null;
+    return { value: parseInt(m[2], 10) / d, unit: normalizeUnit(m[3]) };
+  }
+  // 分数「1/2」
+  if ((m = s.match(/^(\d+)\s*\/\s*(\d+)(.*)$/))) {
+    const d = parseInt(m[2], 10);
+    if (!d) return null;
+    return { value: parseInt(m[1], 10) / d, unit: normalizeUnit(m[3]) };
+  }
+  // 小数・整数「200g」「0.5個」
+  if ((m = s.match(/^(\d+(?:\.\d+)?)(.*)$/))) {
+    return { value: parseFloat(m[1]), unit: normalizeUnit(m[2]) };
+  }
+  return null;
+};
+
+const formatNumber = (n: number): string => String(Math.round(n * 100) / 100);
+
+/**
+ * 同じ食材の量をまとめる。
+ * 単位が同じものだけを合計し、違う単位は「200g ＋ 1パック」のように併記する。
+ * 数値が取れない量（大さじ1・少々など）は合計せず、重複を除いて並べる。
+ */
+const sumAmounts = (amounts: string[]): string => {
+  const parsed: ParsedAmount[] = [];
+  const unparsable: string[] = [];
+
+  for (const a of amounts) {
+    const p = parseAmount(a);
+    if (p) parsed.push(p);
+    else if (a.trim()) unparsable.push(a.trim());
+  }
+
+  // 単位が1種類しか出てこない場合、単位なしの数値（「半分」など）はその単位とみなす
+  const units = [...new Set(parsed.map((p) => p.unit).filter((u) => u !== ""))];
+  if (units.length === 1) {
+    parsed.forEach((p) => {
+      if (p.unit === "") p.unit = units[0];
+    });
+  }
+
+  const sums = new Map<string, number>();
+  for (const p of parsed) sums.set(p.unit, (sums.get(p.unit) ?? 0) + p.value);
+
+  const parts = [...sums.entries()].map(([u, v]) => `${formatNumber(v)}${u}`);
+  const uniqueRaw = [...new Set(unparsable)];
+  return [...parts, ...uniqueRaw].join(" ＋ ");
+};
+
+// ===================================================================
+// 食材文字列の読み書き
+// ===================================================================
+
+// "#醤油:少々" → { name: "醤油", amount: "少々", isSeasoning: true }
+const parseIngredient = (str: string): IngredientRow => {
+  let s = str;
+  let isSeasoning = false;
+  if (s.startsWith(SEASONING_PREFIX)) {
+    isSeasoning = true;
+    s = s.slice(SEASONING_PREFIX.length);
+  }
+  const idx = s.indexOf(":");
+  if (idx === -1) return { name: s, amount: "", isSeasoning };
+  return { name: s.slice(0, idx), amount: s.slice(idx + 1), isSeasoning };
+};
+
+// { name: "醤油", amount: "少々", isSeasoning: true } → "#醤油:少々"
+const formatIngredient = (row: IngredientRow): string => {
+  const name = row.name.trim();
+  const amount = row.amount.trim();
+  if (!name) return "";
+  const base = amount ? `${name}:${amount}` : name;
+  return row.isSeasoning ? SEASONING_PREFIX + base : base;
+};
+
+const emptyRow = (): IngredientRow => ({ name: "", amount: "", isSeasoning: false });
+
+// ===================================================================
 // 食材行のUI（コンポーネントをHome外に定義することでリセットを防ぐ）
+// ===================================================================
 function IngredientRowsInput({
   rows,
   onChange,
+  onToggleSeasoning,
   onAdd,
   onRemove,
 }: {
   rows: IngredientRow[];
-  onChange: (index: number, field: keyof IngredientRow, value: string) => void;
+  onChange: (index: number, field: "name" | "amount", value: string) => void;
+  onToggleSeasoning: (index: number) => void;
   onAdd: () => void;
   onRemove: (index: number) => void;
 }) {
@@ -40,11 +206,20 @@ function IngredientRowsInput({
           />
           <input
             type="text"
-            placeholder="量（例: 200g）"
+            placeholder={row.isSeasoning ? "量（任意）" : "量（例: 200g）"}
             value={row.amount}
             onChange={(e) => onChange(idx, "amount", e.target.value)}
             className="amount-input"
           />
+          <button
+            type="button"
+            className={`btn-seasoning ${row.isSeasoning ? "active" : ""}`}
+            onClick={() => onToggleSeasoning(idx)}
+            title={row.isSeasoning ? "調味料（買い物リストで数量を集計しません）" : "調味料にする"}
+            aria-pressed={row.isSeasoning}
+          >
+            調
+          </button>
           {rows.length > 1 && (
             <button
               type="button"
@@ -60,30 +235,18 @@ function IngredientRowsInput({
       <button type="button" className="btn-add-row" onClick={onAdd}>
         ＋ 食材を追加
       </button>
+      <p className="ingredient-hint">
+        「調」を押すと調味料になり、買い物リストで数量を集計しません。
+      </p>
     </div>
   );
 }
-
-// "豚肉:200g" → { name: "豚肉", amount: "200g" }
-const parseIngredient = (str: string): IngredientRow => {
-  const idx = str.indexOf(":");
-  if (idx === -1) return { name: str, amount: "" };
-  return { name: str.slice(0, idx), amount: str.slice(idx + 1) };
-};
-
-// { name: "豚肉", amount: "200g" } → "豚肉:200g"
-const formatIngredient = (row: IngredientRow): string => {
-  const name = row.name.trim();
-  const amount = row.amount.trim();
-  if (!name) return "";
-  return amount ? `${name}:${amount}` : name;
-};
 
 export default function Home() {
   // --- 状態管理 ---
   const [menus, setMenus] = useState<Menu[]>([]);
   const [newMenuName, setNewMenuName] = useState("");
-  const [newIngredientRows, setNewIngredientRows] = useState<IngredientRow[]>([{ name: "", amount: "" }]);
+  const [newIngredientRows, setNewIngredientRows] = useState<IngredientRow[]>([emptyRow()]);
   const [newMemo, setNewMemo] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [isLoaded, setIsLoaded] = useState(false);
@@ -91,7 +254,7 @@ export default function Home() {
   const [selectedMenuId, setSelectedMenuId] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState("");
-  const [editIngredientRows, setEditIngredientRows] = useState<IngredientRow[]>([{ name: "", amount: "" }]);
+  const [editIngredientRows, setEditIngredientRows] = useState<IngredientRow[]>([emptyRow()]);
   const [editMemo, setEditMemo] = useState("");
 
   const [showBulkImport, setShowBulkImport] = useState(false);
@@ -101,8 +264,27 @@ export default function Home() {
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedMenuIds, setSelectedMenuIds] = useState<string[]>([]);
   const [showShoppingList, setShowShoppingList] = useState(false);
-  const [editableShoppingList, setEditableShoppingList] = useState<{ name: string; total: string }[]>([]);
+  const [editableShoppingList, setEditableShoppingList] = useState<ShoppingItem[]>([]);
   const [isEditingShoppingList, setIsEditingShoppingList] = useState(false);
+
+  // --- 調味料の自動判定（組み込み辞書＋登録済みデータからの学習） ---
+  const learnedSeasonings = useMemo(() => {
+    const set = new Set<string>();
+    menus.forEach((menu) => {
+      menu.ingredients.forEach((ing) => {
+        const p = parseIngredient(ing);
+        const n = p.name.trim();
+        if (p.isSeasoning && n) set.add(n);
+      });
+    });
+    return set;
+  }, [menus]);
+
+  const isKnownSeasoning = (name: string): boolean => {
+    const n = name.trim();
+    if (!n) return false;
+    return SEASONINGS.includes(n) || learnedSeasonings.has(n);
+  };
 
   // --- データの取得とリアルタイム購読 ---
   const fetchMenus = async (): Promise<boolean> => {
@@ -157,17 +339,42 @@ export default function Home() {
   }, []);
 
   // --- 食材行の操作 ---
-  const updateNewIngredientRow = (index: number, field: keyof IngredientRow, value: string) => {
-    setNewIngredientRows(prev => prev.map((row, i) => i === index ? { ...row, [field]: value } : row));
-  };
-  const addNewIngredientRow = () => setNewIngredientRows(prev => [...prev, { name: "", amount: "" }]);
-  const removeNewIngredientRow = (index: number) => setNewIngredientRows(prev => prev.filter((_, i) => i !== index));
+  const makeRowUpdater =
+    (setter: React.Dispatch<React.SetStateAction<IngredientRow[]>>) =>
+    (index: number, field: "name" | "amount", value: string) => {
+      setter((prev) =>
+        prev.map((row, i) => {
+          if (i !== index) return row;
+          const next: IngredientRow = { ...row, [field]: value };
+          // 食材名を入れた時点で、辞書・学習結果に一致すれば調味料を自動ON（手動操作済みなら尊重）
+          if (field === "name" && !row.touched) {
+            next.isSeasoning = isKnownSeasoning(value);
+          }
+          return next;
+        })
+      );
+    };
 
-  const updateEditIngredientRow = (index: number, field: keyof IngredientRow, value: string) => {
-    setEditIngredientRows(prev => prev.map((row, i) => i === index ? { ...row, [field]: value } : row));
-  };
-  const addEditIngredientRow = () => setEditIngredientRows(prev => [...prev, { name: "", amount: "" }]);
-  const removeEditIngredientRow = (index: number) => setEditIngredientRows(prev => prev.filter((_, i) => i !== index));
+  const makeSeasoningToggler =
+    (setter: React.Dispatch<React.SetStateAction<IngredientRow[]>>) => (index: number) => {
+      setter((prev) =>
+        prev.map((row, i) =>
+          i === index ? { ...row, isSeasoning: !row.isSeasoning, touched: true } : row
+        )
+      );
+    };
+
+  const updateNewIngredientRow = makeRowUpdater(setNewIngredientRows);
+  const toggleNewSeasoning = makeSeasoningToggler(setNewIngredientRows);
+  const addNewIngredientRow = () => setNewIngredientRows((prev) => [...prev, emptyRow()]);
+  const removeNewIngredientRow = (index: number) =>
+    setNewIngredientRows((prev) => prev.filter((_, i) => i !== index));
+
+  const updateEditIngredientRow = makeRowUpdater(setEditIngredientRows);
+  const toggleEditSeasoning = makeSeasoningToggler(setEditIngredientRows);
+  const addEditIngredientRow = () => setEditIngredientRows((prev) => [...prev, emptyRow()]);
+  const removeEditIngredientRow = (index: number) =>
+    setEditIngredientRows((prev) => prev.filter((_, i) => i !== index));
 
   // --- イベントハンドラ ---
 
@@ -178,7 +385,7 @@ export default function Home() {
 
     const ingredientsArray = newIngredientRows
       .map(formatIngredient)
-      .filter(s => s !== "");
+      .filter((s) => s !== "");
 
     const newMenu = {
       id: crypto.randomUUID(),
@@ -197,7 +404,7 @@ export default function Home() {
     }
 
     setNewMenuName("");
-    setNewIngredientRows([{ name: "", amount: "" }]);
+    setNewIngredientRows([emptyRow()]);
     setNewMemo("");
   };
 
@@ -215,17 +422,29 @@ export default function Home() {
       if (!name) return;
 
       const ingredientsStr = parts.length > 1 ? parts[1] : "";
-      // "豚肉 200g" → "豚肉:200g" に変換して保存
+      // "豚肉 200g" → "豚肉:200g" / "#醤油 大さじ1" → "#醤油:大さじ1"
       const ingredientsArray = ingredientsStr
         .split(/[,、]+/)
         .map((ing) => {
-          const trimmed = ing.trim();
+          let trimmed = ing.trim();
           if (!trimmed) return "";
+
+          // 先頭の # を調味料マーカーとして解釈
+          let isSeasoning = false;
+          if (trimmed.startsWith(SEASONING_PREFIX)) {
+            isSeasoning = true;
+            trimmed = trimmed.slice(SEASONING_PREFIX.length).trim();
+          }
+          if (!trimmed) return "";
+
           const spaceIdx = trimmed.search(/\s+/);
-          if (spaceIdx === -1) return trimmed; // 量なし
-          const ingName = trimmed.slice(0, spaceIdx).trim();
-          const ingAmount = trimmed.slice(spaceIdx).trim();
-          return ingAmount ? `${ingName}:${ingAmount}` : ingName;
+          const ingName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx).trim();
+          const ingAmount = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx).trim();
+
+          // # が付いていなくても、辞書・学習結果に一致すれば調味料として登録
+          if (!isSeasoning && isKnownSeasoning(ingName)) isSeasoning = true;
+
+          return formatIngredient({ name: ingName, amount: ingAmount, isSeasoning });
         })
         .filter((ing) => ing !== "");
 
@@ -247,18 +466,25 @@ export default function Home() {
   };
 
   // 呪文コピー
-  const handleCopyPrompt = () => {
-    const promptText = `以下の画像（またはテキスト）から料理のメニュー名と、使われている主な食材・分量を抽出してください。
+  const PROMPT_TEXT = `以下の画像（またはテキスト）から料理のメニュー名と、使われている主な食材・分量を抽出してください。
 出力形式は必ず以下の「1行1メニュー」の形式でお願いします。余計な文章は不要です。
 
 【出力フォーマット】
 メニュー名: 食材1 分量1, 食材2 分量2, 食材3 分量3
 
+【表記のルール】
+1. 食材名は原則として漢字で書く（例:「ぶたにく」ではなく「豚肉」）
+2. 単位は g / ml / 個 / 本 / 枚 / パック のいずれかに揃える
+3. 分数は使わず小数で書く（例:「1/2個」ではなく「0.5個」）
+4. 数字と単位は全角ではなく半角で書く
+5. 調味料（醤油・みりん・砂糖・塩・油・だし等）は食材名の先頭に # を付ける
+
 【例】
-豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 1個, 生姜 1かけ
+豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 0.5個, #醤油 大さじ1, #みりん 大さじ1
 分量が不明な場合は食材名だけでもOKです。`;
 
-    navigator.clipboard.writeText(promptText).then(() => {
+  const handleCopyPrompt = () => {
+    navigator.clipboard.writeText(PROMPT_TEXT).then(() => {
       setCopySuccess(true);
       setTimeout(() => setCopySuccess(false), 2000);
     });
@@ -295,8 +521,8 @@ export default function Home() {
     setEditName(menu.name);
     setEditIngredientRows(
       menu.ingredients.length > 0
-        ? menu.ingredients.map(parseIngredient)
-        : [{ name: "", amount: "" }]
+        ? menu.ingredients.map((ing) => ({ ...parseIngredient(ing), touched: true }))
+        : [emptyRow()]
     );
     setEditMemo(menu.memo || "");
     setIsEditing(true);
@@ -309,7 +535,7 @@ export default function Home() {
 
     const ingredientsArray = editIngredientRows
       .map(formatIngredient)
-      .filter(s => s !== "");
+      .filter((s) => s !== "");
 
     setMenus(menus.map((menu) =>
       menu.id === selectedMenuId
@@ -337,40 +563,37 @@ export default function Home() {
     );
   };
 
-  // 買い物リストの組み立て（食材ごとに数量を合計）
-  type ShoppingItem = { name: string; total: string };
+  // 買い物リストの組み立て
   const buildShoppingList = (): ShoppingItem[] => {
-    const map = new Map<string, string[]>();
-    selectedMenuIds.forEach(id => {
-      const menu = menus.find(m => m.id === id);
+    const normal = new Map<string, string[]>();
+    const seasoning = new Set<string>();
+
+    selectedMenuIds.forEach((id) => {
+      const menu = menus.find((m) => m.id === id);
       if (!menu) return;
-      menu.ingredients.forEach(ing => {
-        const { name, amount } = parseIngredient(ing);
-        if (!name) return;
-        if (!map.has(name)) map.set(name, []);
-        if (amount) map.get(name)!.push(amount);
+      menu.ingredients.forEach((ing) => {
+        const { name, amount, isSeasoning } = parseIngredient(ing);
+        const n = name.trim();
+        if (!n) return;
+        if (isSeasoning) {
+          // 調味料は名前だけを集める（数量は集計しない）
+          seasoning.add(n);
+          return;
+        }
+        if (!normal.has(n)) normal.set(n, []);
+        if (amount) normal.get(n)!.push(amount);
       });
     });
 
-    return Array.from(map.entries())
-      .map(([name, amounts]) => {
-        if (amounts.length === 0) return { name, total: "" };
-        // 数字部分を合計し、単位は最初のものを流用
-        let sum = 0;
-        let unit = "";
-        for (const a of amounts) {
-          const m = a.match(/^(\d+(?:\.\d+)?)(.*)/);
-          if (m) {
-            sum += parseFloat(m[1]);
-            if (!unit) unit = m[2].trim();
-          }
-        }
-        const total = sum > 0
-          ? `${Number.isInteger(sum) ? sum : sum}${unit}`
-          : amounts.join(", ");
-        return { name, total };
-      })
+    const normalItems: ShoppingItem[] = [...normal.entries()]
+      .map(([name, amounts]) => ({ name, total: sumAmounts(amounts), isSeasoning: false }))
       .sort((a, b) => a.name.localeCompare(b.name, "ja"));
+
+    const seasoningItems: ShoppingItem[] = [...seasoning]
+      .map((name) => ({ name, total: "", isSeasoning: true }))
+      .sort((a, b) => a.name.localeCompare(b.name, "ja"));
+
+    return [...normalItems, ...seasoningItems];
   };
 
   // 買い物リストをテキストとしてコピー
@@ -380,12 +603,23 @@ export default function Home() {
       .map(id => menus.find(m => m.id === id)?.name ?? "")
       .filter(Boolean)
       .join("、");
-    const lines = [
-      `【買い物リスト】`,
-      `（${selectedMenuNames}）`,
-      ``,
-      ...list.map(item => item.total ? `□ ${item.name}　${item.total}` : `□ ${item.name}`),
-    ];
+
+    const normals = list.filter((i) => i.name && !i.isSeasoning);
+    const seasonings = list.filter((i) => i.name && i.isSeasoning);
+
+    const lines: string[] = [`【買い物リスト】`, `（${selectedMenuNames}）`];
+
+    if (normals.length > 0) {
+      lines.push(``, `■ 食材`);
+      normals.forEach((item) =>
+        lines.push(item.total ? `□ ${item.name}　${item.total}` : `□ ${item.name}`)
+      );
+    }
+    if (seasonings.length > 0) {
+      lines.push(``, `■ 調味料（数量は集計していません）`);
+      seasonings.forEach((item) => lines.push(`□ ${item.name}`));
+    }
+
     navigator.clipboard.writeText(lines.join("\n")).then(() => {
       setShoppingCopySuccess(true);
       setTimeout(() => setShoppingCopySuccess(false), 2000);
@@ -404,6 +638,8 @@ export default function Home() {
   if (!isLoaded) return null;
 
   const selectedMenu = selectedMenuId ? menus.find(m => m.id === selectedMenuId) : null;
+  const shoppingNormals = editableShoppingList.filter((i) => i.name && !i.isSeasoning);
+  const shoppingSeasonings = editableShoppingList.filter((i) => i.name && i.isSeasoning);
 
   return (
     <div className="container">
@@ -432,56 +668,84 @@ export default function Home() {
             </p>
 
             {isEditingShoppingList ? (
-              <>
-                <div className="ingredient-rows">
-                  {editableShoppingList.map((item, idx) => (
-                    <div key={idx} className="ingredient-row">
-                      <input
-                        type="text"
-                        placeholder="食材名"
-                        value={item.name}
-                        onChange={(e) => setEditableShoppingList(prev => prev.map((x, i) => i === idx ? { ...x, name: e.target.value } : x))}
-                      />
-                      <input
-                        type="text"
-                        placeholder="量"
-                        value={item.total}
-                        onChange={(e) => setEditableShoppingList(prev => prev.map((x, i) => i === idx ? { ...x, total: e.target.value } : x))}
-                        className="amount-input"
-                      />
-                      <button
-                        type="button"
-                        className="btn-remove-row"
-                        onClick={() => setEditableShoppingList(prev => prev.filter((_, i) => i !== idx))}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                  <button
-                    type="button"
-                    className="btn-add-row"
-                    onClick={() => setEditableShoppingList(prev => [...prev, { name: "", total: "" }])}
-                  >
-                    ＋ 食材を追加
-                  </button>
-                </div>
-              </>
+              <div className="ingredient-rows">
+                {editableShoppingList.map((item, idx) => (
+                  <div key={idx} className="ingredient-row">
+                    <input
+                      type="text"
+                      placeholder="食材名"
+                      value={item.name}
+                      onChange={(e) => setEditableShoppingList(prev => prev.map((x, i) => i === idx ? { ...x, name: e.target.value } : x))}
+                    />
+                    <input
+                      type="text"
+                      placeholder={item.isSeasoning ? "—" : "量"}
+                      value={item.total}
+                      onChange={(e) => setEditableShoppingList(prev => prev.map((x, i) => i === idx ? { ...x, total: e.target.value } : x))}
+                      className="amount-input"
+                    />
+                    <button
+                      type="button"
+                      className={`btn-seasoning ${item.isSeasoning ? "active" : ""}`}
+                      onClick={() => setEditableShoppingList(prev => prev.map((x, i) => i === idx ? { ...x, isSeasoning: !x.isSeasoning } : x))}
+                      title="調味料に切り替え"
+                      aria-pressed={item.isSeasoning}
+                    >
+                      調
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-remove-row"
+                      onClick={() => setEditableShoppingList(prev => prev.filter((_, i) => i !== idx))}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="btn-add-row"
+                  onClick={() => setEditableShoppingList(prev => [...prev, { name: "", total: "", isSeasoning: false }])}
+                >
+                  ＋ 食材を追加
+                </button>
+              </div>
             ) : (
               <>
-                {editableShoppingList.length === 0 ? (
+                {shoppingNormals.length === 0 && shoppingSeasonings.length === 0 ? (
                   <p style={{ color: "var(--text-light)" }}>食材が登録されていません</p>
                 ) : (
-                  <ul className="shopping-list">
-                    {editableShoppingList.filter(item => item.name).map((item, idx) => (
-                      <li key={idx} className="shopping-item">
-                        <span className="shopping-name">{item.name}</span>
-                        {item.total && (
-                          <span className="shopping-count">{item.total}</span>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
+                  <>
+                    {shoppingNormals.length > 0 && (
+                      <>
+                        <h3 className="shopping-section-title">食材</h3>
+                        <ul className="shopping-list">
+                          {shoppingNormals.map((item, idx) => (
+                            <li key={`n-${idx}`} className="shopping-item">
+                              <span className="shopping-name">{item.name}</span>
+                              {item.total && (
+                                <span className="shopping-count">{item.total}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                    {shoppingSeasonings.length > 0 && (
+                      <>
+                        <h3 className="shopping-section-title">
+                          調味料<span className="shopping-section-note">数量は集計しません</span>
+                        </h3>
+                        <ul className="shopping-list">
+                          {shoppingSeasonings.map((item, idx) => (
+                            <li key={`s-${idx}`} className="shopping-item">
+                              <span className="shopping-name">{item.name}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </>
                 )}
                 <button
                   className="btn-copy-shopping"
@@ -520,6 +784,7 @@ export default function Home() {
                   <IngredientRowsInput
                     rows={editIngredientRows}
                     onChange={updateEditIngredientRow}
+                    onToggleSeasoning={toggleEditSeasoning}
                     onAdd={addEditIngredientRow}
                     onRemove={removeEditIngredientRow}
                   />
@@ -556,17 +821,18 @@ export default function Home() {
                       </thead>
                       <tbody>
                         {selectedMenu.ingredients.map((ing, idx) => {
-                          const { name, amount } = parseIngredient(ing);
+                          const { name, amount, isSeasoning } = parseIngredient(ing);
                           return (
                             <tr key={idx}>
                               <td>
                                 <span
-                                  className="tag"
+                                  className={`tag ${isSeasoning ? "tag-seasoning" : ""}`}
                                   onClick={(e) => handleTagClick(ing, e)}
                                   title={`${name} で検索`}
                                 >
                                   {name}
                                 </span>
+                                {isSeasoning && <span className="seasoning-badge">調味料</span>}
                               </td>
                               <td className="amount-cell">{amount || "—"}</td>
                             </tr>
@@ -621,6 +887,7 @@ export default function Home() {
                 <IngredientRowsInput
                   rows={newIngredientRows}
                   onChange={updateNewIngredientRow}
+                  onToggleSeasoning={toggleNewSeasoning}
                   onAdd={addNewIngredientRow}
                   onRemove={removeNewIngredientRow}
                 />
@@ -643,14 +910,7 @@ export default function Home() {
                   <div className="prompt-box">
                     <p><strong>1. AIへの指示文（プロンプト）</strong></p>
                     <p>レシピの画像をChatGPT等に送り、以下の呪文をコピーして貼り付けてください。</p>
-                    <code>
-                      以下の画像から料理のメニュー名と、使われている主な食材・分量を抽出してください。出力形式は必ず以下の「1行1メニュー」の形式でお願いします。余計な文章は不要です。<br/>
-                      【出力フォーマット】<br/>
-                      メニュー名: 食材1 分量1, 食材2 分量2, 食材3 分量3<br/>
-                      【例】<br/>
-                      豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 1個, 生姜 1かけ<br/>
-                      分量が不明な場合は食材名だけでもOKです。
-                    </code>
+                    <code>{PROMPT_TEXT}</code>
                     <button className="btn-copy" onClick={handleCopyPrompt}>
                       {copySuccess ? "✓ コピーしました！" : "呪文をコピーする"}
                     </button>
@@ -659,7 +919,7 @@ export default function Home() {
                   <div className="input-group">
                     <label>2. AIからの返答をここに貼り付け</label>
                     <textarea
-                      placeholder="豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 1個, 生姜 1かけ&#13;&#10;カレーライス: 豚肉 300g, じゃがいも 2個, にんじん 1本"
+                      placeholder="豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 0.5個, #醤油 大さじ1&#13;&#10;カレーライス: 豚肉 300g, じゃがいも 2個, にんじん 1本"
                       value={bulkText}
                       onChange={(e) => setBulkText(e.target.value)}
                       style={{ minHeight: "120px" }}
@@ -735,15 +995,18 @@ export default function Home() {
                       <h3>{menu.name}</h3>
                       {menu.ingredients.length > 0 && (
                         <div className="tag-list">
-                          {menu.ingredients.map((ing, idx) => (
-                            <span
-                              key={idx}
-                              className="tag"
-                              onClick={(e) => { if (!isSelectMode) handleTagClick(ing, e); }}
-                            >
-                              {parseIngredient(ing).name}
-                            </span>
-                          ))}
+                          {menu.ingredients.map((ing, idx) => {
+                            const p = parseIngredient(ing);
+                            return (
+                              <span
+                                key={idx}
+                                className={`tag ${p.isSeasoning ? "tag-seasoning" : ""}`}
+                                onClick={(e) => { if (!isSelectMode) handleTagClick(ing, e); }}
+                              >
+                                {p.name}
+                              </span>
+                            );
+                          })}
                         </div>
                       )}
                     </div>
@@ -775,3 +1038,5 @@ export default function Home() {
     </div>
   );
 }
+
+type ShoppingItem = { name: string; total: string; isSeasoning: boolean };
