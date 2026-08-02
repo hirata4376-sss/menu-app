@@ -179,6 +179,31 @@ const formatIngredient = (row: IngredientRow): string => {
 const emptyRow = (): IngredientRow => ({ name: "", amount: "", isSeasoning: false });
 
 // ===================================================================
+// 一括登録用のプロンプト（呪文）
+// ===================================================================
+
+/** 呪文に差し込む登録済み食材名の上限（長くなりすぎるのを防ぐ） */
+const MAX_PROMPT_SUGGESTIONS = 200;
+
+const BASE_PROMPT = `以下の画像（またはテキスト）から料理のメニュー名と、使われている主な食材・分量を抽出してください。
+出力形式は必ず以下の「1行1メニュー」の形式でお願いします。余計な文章は不要です。
+
+【出力フォーマット】
+メニュー名: 食材1 分量1, 食材2 分量2, 食材3 分量3
+
+【表記のルール】
+1. 食材名は原則として漢字で書く（例:「ぶたにく」ではなく「豚肉」）
+2. 単位は g / ml / 個 / 本 / 枚 / パック のいずれかに揃える
+3. 分数は使わず小数で書く（例:「1/2個」ではなく「0.5個」）
+4. 数字と単位は全角ではなく半角で書く
+5. 調味料（醤油・みりん・砂糖・塩・油・だし等）は食材名の先頭に # を付ける
+6. 1つの欄に複数の食材を書かない（「ごま油またはサラダ油」は不可。1食材1つ）
+
+【例】
+豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 0.5個, #醤油 大さじ1, #みりん 大さじ1
+分量が不明な場合は食材名だけでもOKです。`;
+
+// ===================================================================
 // 食材行のUI（コンポーネントをHome外に定義することでリセットを防ぐ）
 // ===================================================================
 function IngredientRowsInput({
@@ -187,19 +212,31 @@ function IngredientRowsInput({
   onToggleSeasoning,
   onAdd,
   onRemove,
+  suggestions,
+  listId,
 }: {
   rows: IngredientRow[];
   onChange: (index: number, field: "name" | "amount", value: string) => void;
   onToggleSeasoning: (index: number) => void;
   onAdd: () => void;
   onRemove: (index: number) => void;
+  /** 登録済みの食材名（表記を揃えるための入力候補） */
+  suggestions: string[];
+  listId: string;
 }) {
   return (
     <div className="ingredient-rows">
+      <datalist id={listId}>
+        {suggestions.map((s) => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
       {rows.map((row, idx) => (
         <div key={idx} className="ingredient-row">
           <input
             type="text"
+            list={listId}
+            autoComplete="off"
             placeholder="食材名（例: 豚肉）"
             value={row.name}
             onChange={(e) => onChange(idx, "name", e.target.value)}
@@ -237,6 +274,7 @@ function IngredientRowsInput({
       </button>
       <p className="ingredient-hint">
         「調」を押すと調味料になり、買い物リストで数量を集計しません。
+        {suggestions.length > 0 && `　食材名を打つと、登録済みの${suggestions.length}件から候補が出ます。`}
       </p>
     </div>
   );
@@ -279,6 +317,32 @@ export default function Home() {
     });
     return set;
   }, [menus]);
+
+  // --- 登録済みの食材名（入力候補＋呪文への差し込み用。使用回数の多い順） ---
+  const ingredientStats = useMemo(() => {
+    const map = new Map<string, { count: number; seasoning: number }>();
+    menus.forEach((menu) => {
+      menu.ingredients.forEach((ing) => {
+        const p = parseIngredient(ing);
+        const n = p.name.trim();
+        if (!n) return;
+        const cur = map.get(n) ?? { count: 0, seasoning: 0 };
+        cur.count += 1;
+        if (p.isSeasoning) cur.seasoning += 1;
+        map.set(n, cur);
+      });
+    });
+    return [...map.entries()]
+      .map(([name, v]) => ({
+        name,
+        count: v.count,
+        // 半数以上が調味料として登録されている、または組み込み辞書にあれば調味料とみなす
+        isSeasoning: v.seasoning * 2 >= v.count || SEASONINGS.includes(name),
+      }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "ja"));
+  }, [menus]);
+
+  const nameSuggestions = useMemo(() => ingredientStats.map((s) => s.name), [ingredientStats]);
 
   const isKnownSeasoning = (name: string): boolean => {
     const n = name.trim();
@@ -465,26 +529,24 @@ export default function Home() {
     }
   };
 
-  // 呪文コピー
-  const PROMPT_TEXT = `以下の画像（またはテキスト）から料理のメニュー名と、使われている主な食材・分量を抽出してください。
-出力形式は必ず以下の「1行1メニュー」の形式でお願いします。余計な文章は不要です。
+  // 呪文コピー（登録済みの食材名を末尾に差し込み、AIに表記を揃えさせる）
+  const buildPromptText = (): string => {
+    if (ingredientStats.length === 0) return BASE_PROMPT;
+    const list = ingredientStats
+      .slice(0, MAX_PROMPT_SUGGESTIONS)
+      .map((s) => (s.isSeasoning ? SEASONING_PREFIX + s.name : s.name))
+      .join(", ");
+    return `${BASE_PROMPT}
 
-【出力フォーマット】
-メニュー名: 食材1 分量1, 食材2 分量2, 食材3 分量3
+【すでに登録済みの食材名】
+${list}
 
-【表記のルール】
-1. 食材名は原則として漢字で書く（例:「ぶたにく」ではなく「豚肉」）
-2. 単位は g / ml / 個 / 本 / 枚 / パック のいずれかに揃える
-3. 分数は使わず小数で書く（例:「1/2個」ではなく「0.5個」）
-4. 数字と単位は全角ではなく半角で書く
-5. 調味料（醤油・みりん・砂糖・塩・油・だし等）は食材名の先頭に # を付ける
-
-【例】
-豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 0.5個, #醤油 大さじ1, #みりん 大さじ1
-分量が不明な場合は食材名だけでもOKです。`;
+上の一覧に同じ食材があれば、必ずその表記をそのまま使ってください。
+一覧にないものだけ、新しく書いてください。`;
+  };
 
   const handleCopyPrompt = () => {
-    navigator.clipboard.writeText(PROMPT_TEXT).then(() => {
+    navigator.clipboard.writeText(buildPromptText()).then(() => {
       setCopySuccess(true);
       setTimeout(() => setCopySuccess(false), 2000);
     });
@@ -787,6 +849,8 @@ export default function Home() {
                     onToggleSeasoning={toggleEditSeasoning}
                     onAdd={addEditIngredientRow}
                     onRemove={removeEditIngredientRow}
+                    suggestions={nameSuggestions}
+                    listId="ingredient-options-edit"
                   />
                 </div>
                 <div className="input-group">
@@ -890,6 +954,8 @@ export default function Home() {
                   onToggleSeasoning={toggleNewSeasoning}
                   onAdd={addNewIngredientRow}
                   onRemove={removeNewIngredientRow}
+                  suggestions={nameSuggestions}
+                  listId="ingredient-options-new"
                 />
               </div>
               <button type="submit" className="btn-primary">
@@ -910,7 +976,13 @@ export default function Home() {
                   <div className="prompt-box">
                     <p><strong>1. AIへの指示文（プロンプト）</strong></p>
                     <p>レシピの画像をChatGPT等に送り、以下の呪文をコピーして貼り付けてください。</p>
-                    <code>{PROMPT_TEXT}</code>
+                    <code>{BASE_PROMPT}</code>
+                    {ingredientStats.length > 0 && (
+                      <p className="prompt-note">
+                        コピーすると、この後ろに<strong>登録済みの食材名{Math.min(ingredientStats.length, MAX_PROMPT_SUGGESTIONS)}件</strong>が自動で追記されます。
+                        AIが既存の表記に揃えてくれるので、表記ゆれが起きにくくなります。
+                      </p>
+                    )}
                     <button className="btn-copy" onClick={handleCopyPrompt}>
                       {copySuccess ? "✓ コピーしました！" : "呪文をコピーする"}
                     </button>
