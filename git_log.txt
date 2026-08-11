@@ -1,1 +1,10 @@
 ===== 2026/08/02 22:46:10.48 ===== 
+warning: in the working copy of 'GUIDELINE.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/app/globals.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/app/page.tsx', LF will be replaced by CRLF the next time Git touches it
+[main a69f65a] update
+ 4 files changed, 199 insertions(+), 21 deletions(-)
+To https://github.com/hirata4376-sss/menu-app.git
+   2b8513c..a69f65a  main -> main
+branch 'main' set up to track 'origin/main'.
+===== done ===== 
