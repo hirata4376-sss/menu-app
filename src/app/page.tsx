@@ -297,6 +297,11 @@ export default function Home() {
 
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [bulkText, setBulkText] = useState("");
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [extractError, setExtractError] = useState("");
+  const [remaining, setRemaining] = useState<number | null>(null);
   const [copySuccess, setCopySuccess] = useState(false);
 
   const [isSelectMode, setIsSelectMode] = useState(false);
@@ -526,6 +531,51 @@ export default function Home() {
         console.error("一括保存エラー:", error);
         fetchMenus();
       }
+    }
+  };
+
+  // 画像選択
+  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImageFile(file);
+    setExtractError("");
+    const reader = new FileReader();
+    reader.onloadend = () => setImagePreview(reader.result as string);
+    reader.readAsDataURL(file);
+    e.target.value = ""; // 同じファイルを再選択できるようにリセット
+  };
+
+  // Geminiで画像から食材を自動抽出
+  const handleGeminiExtract = async () => {
+    if (!imageFile) return;
+    setIsExtracting(true);
+    setExtractError("");
+
+    const formData = new FormData();
+    formData.append("image", imageFile);
+
+    try {
+      const res = await fetch("/api/extract-menu", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setExtractError(data.error ?? "エラーが発生しました。");
+        return;
+      }
+
+      setBulkText(data.result);
+      setRemaining(data.remaining);
+      setImageFile(null);
+      setImagePreview(null);
+    } catch {
+      setExtractError("通信エラーが発生しました。インターネット接続を確認してください。");
+    } finally {
+      setIsExtracting(false);
     }
   };
 
@@ -973,23 +1023,86 @@ ${list}
 
               {showBulkImport && (
                 <div style={{ marginTop: "16px" }}>
+
+                  {/* === Gemini 自動抽出エリア === */}
                   <div className="prompt-box">
-                    <p><strong>1. AIへの指示文（プロンプト）</strong></p>
-                    <p>レシピの画像をChatGPT等に送り、以下の呪文をコピーして貼り付けてください。</p>
-                    <code>{BASE_PROMPT}</code>
-                    {ingredientStats.length > 0 && (
-                      <p className="prompt-note">
-                        コピーすると、この後ろに<strong>登録済みの食材名{Math.min(ingredientStats.length, MAX_PROMPT_SUGGESTIONS)}件</strong>が自動で追記されます。
-                        AIが既存の表記に揃えてくれるので、表記ゆれが起きにくくなります。
+                    <p><strong>📷 画像から自動抽出（Gemini AI）</strong></p>
+                    <p style={{ marginTop: "6px", fontSize: "0.85rem" }}>
+                      レシピや献立表の写真を選ぶと、メニュー名と食材を自動で読み取ります。
+                    </p>
+
+                    {/* 画像アップロードエリア */}
+                    <div
+                      className="image-upload-area"
+                      onClick={() => document.getElementById("imageInput")?.click()}
+                    >
+                      {imagePreview ? (
+                        <img src={imagePreview} alt="選択中の画像" className="image-preview" />
+                      ) : (
+                        <div className="image-upload-placeholder">
+                          <span style={{ fontSize: "2rem" }}>📷</span>
+                          <span>タップして画像を選択</span>
+                        </div>
+                      )}
+                    </div>
+                    <input
+                      id="imageInput"
+                      type="file"
+                      accept="image/*"
+                      style={{ display: "none" }}
+                      onChange={handleImageChange}
+                    />
+
+                    {imageFile && (
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={handleGeminiExtract}
+                        disabled={isExtracting}
+                        style={{ marginTop: "12px" }}
+                      >
+                        {isExtracting ? "⏳ AIが読み取り中..." : "✨ Geminiで自動抽出する"}
+                      </button>
+                    )}
+
+                    {extractError && (
+                      <p style={{ color: "#ff4a4a", fontSize: "0.85rem", marginTop: "8px" }}>
+                        {extractError}
                       </p>
                     )}
-                    <button className="btn-copy" onClick={handleCopyPrompt}>
-                      {copySuccess ? "✓ コピーしました！" : "呪文をコピーする"}
-                    </button>
+
+                    {remaining !== null && (
+                      <p style={{ fontSize: "0.78rem", color: "var(--text-light)", marginTop: "8px" }}>
+                        本日の残り利用回数: {remaining} / 20
+                      </p>
+                    )}
                   </div>
 
-                  <div className="input-group">
-                    <label>2. AIからの返答をここに貼り付け</label>
+                  {/* === 手動入力（折りたたみ） === */}
+                  <details style={{ marginTop: "12px" }}>
+                    <summary className="bulk-import-toggle" style={{ padding: "8px 0" }}>
+                      手動で貼り付ける場合（AI呪文コピー）
+                    </summary>
+                    <div style={{ marginTop: "12px" }} className="prompt-box">
+                      <p><strong>AIへの指示文（プロンプト）</strong></p>
+                      <p style={{ marginTop: "4px", fontSize: "0.85rem" }}>
+                        レシピ画像をChatGPT等に送り、以下の呪文をコピーして貼り付けてください。
+                      </p>
+                      <code>{BASE_PROMPT}</code>
+                      {ingredientStats.length > 0 && (
+                        <p className="prompt-note">
+                          コピーすると、登録済みの食材名{Math.min(ingredientStats.length, MAX_PROMPT_SUGGESTIONS)}件が自動で追記されます。
+                        </p>
+                      )}
+                      <button className="btn-copy" onClick={handleCopyPrompt}>
+                        {copySuccess ? "✓ コピーしました！" : "呪文をコピーする"}
+                      </button>
+                    </div>
+                  </details>
+
+                  {/* === 結果テキスト（確認・修正可能） === */}
+                  <div className="input-group" style={{ marginTop: "16px" }}>
+                    <label>抽出結果を確認・修正してから登録（編集できます）</label>
                     <textarea
                       placeholder="豚肉の生姜焼き: 豚肉 200g, 玉ねぎ 0.5個, #醤油 大さじ1&#13;&#10;カレーライス: 豚肉 300g, じゃがいも 2個, にんじん 1本"
                       value={bulkText}
