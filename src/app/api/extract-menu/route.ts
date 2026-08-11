@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
 const DAILY_LIMIT = 20;
@@ -10,7 +10,7 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
 export async function POST(request: NextRequest) {
   try {
@@ -46,11 +46,9 @@ export async function POST(request: NextRequest) {
     // 3. 画像をBase64に変換
     const imageBytes = await imageFile.arrayBuffer();
     const imageBase64 = Buffer.from(imageBytes).toString('base64');
-    const mimeType = imageFile.type as 'image/jpeg' | 'image/png' | 'image/webp' | 'image/heic';
+    const mimeType = imageFile.type;
 
     // 4. Gemini APIで食材を抽出（キーはサーバー側のみ・ブラウザ非公開）
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-
     const prompt = `この画像から料理のメニュー名と使われている主な食材を抽出してください。
 出力形式は必ず以下の「1行1メニュー」の形式のみで返してください。余計な文章や説明は一切不要です。
 
@@ -60,17 +58,20 @@ export async function POST(request: NextRequest) {
 複数のメニューがある場合は1行ずつ書いてください。
 料理が1品だけの場合も同じ形式で1行だけ返してください。`;
 
-    const result = await model.generateContent([
-      prompt,
-      {
-        inlineData: {
-          mimeType,
-          data: imageBase64,
+    const response = await genAI.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: imageBase64 } },
+            { text: prompt },
+          ],
         },
-      },
-    ]);
+      ],
+    });
 
-    const extractedText = result.response.text().trim();
+    const extractedText = (response.text ?? '').trim();
 
     // 5. 利用回数を更新（upsert で日付が重複しても安全に書き込み）
     await supabase
