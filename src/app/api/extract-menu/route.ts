@@ -83,9 +83,10 @@ export async function POST(request: NextRequest) {
     });
 
   } catch (error) {
-    console.error('Gemini API error:', error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('Gemini API error:', message);
     return NextResponse.json(
-      { error: 'AI処理中にエラーが発生しました。しばらく待ってから再試行してください。' },
+      { error: `AI処理エラー: ${message}` },
       { status: 500 }
     );
   }
