@@ -49,7 +49,7 @@ export async function POST(request: NextRequest) {
     const mimeType = imageFile.type as 'image/jpeg' | 'image/png' | 'image/webp' | 'image/heic';
 
     // 4. Gemini APIで食材を抽出（キーはサーバー側のみ・ブラウザ非公開）
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
     const prompt = `この画像から料理のメニュー名と使われている主な食材を抽出してください。
 出力形式は必ず以下の「1行1メニュー」の形式のみで返してください。余計な文章や説明は一切不要です。
