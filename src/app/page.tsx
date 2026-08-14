@@ -185,6 +185,20 @@ const emptyRow = (): IngredientRow => ({ name: "", amount: "", isSeasoning: fals
 /** 呪文に差し込む登録済み食材名の上限（長くなりすぎるのを防ぐ） */
 const MAX_PROMPT_SUGGESTIONS = 200;
 
+/** 1回の抽出に添付できる画像の枚数（route.ts 側と揃えること） */
+const MAX_IMAGES = 4;
+
+/** 全画像の合計サイズ上限（4MB）。Vercelのボディ上限4.5MBの手前で止める */
+const MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+
+/** 画像プレビュー用にファイルをdataURLへ変換する */
+const readAsDataURL = (file: File): Promise<string> =>
+  new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.readAsDataURL(file);
+  });
+
 const BASE_PROMPT = `以下の画像（またはテキスト）から料理のメニュー名と、使われている主な食材・分量を抽出してください。
 出力形式は必ず以下の「1行1メニュー」の形式でお願いします。余計な文章は不要です。
 
@@ -297,8 +311,8 @@ export default function Home() {
 
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [bulkText, setBulkText] = useState("");
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [imageFiles, setImageFiles] = useState<File[]>([]);
+  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractError, setExtractError] = useState("");
   const [remaining, setRemaining] = useState<number | null>(null);
@@ -534,26 +548,57 @@ export default function Home() {
     }
   };
 
-  // 画像選択
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setImageFile(file);
-    setExtractError("");
-    const reader = new FileReader();
-    reader.onloadend = () => setImagePreview(reader.result as string);
-    reader.readAsDataURL(file);
+  // 画像選択（既存の選択に追加する。分割レシピを上から順に足していける）
+  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files ?? []);
     e.target.value = ""; // 同じファイルを再選択できるようにリセット
+    if (picked.length === 0) return;
+
+    setExtractError("");
+
+    const room = MAX_IMAGES - imageFiles.length;
+    if (room <= 0) {
+      setExtractError(`画像は${MAX_IMAGES}枚までです。`);
+      return;
+    }
+
+    const accepted = picked.slice(0, room);
+    const nextFiles = [...imageFiles, ...accepted];
+
+    const totalBytes = nextFiles.reduce((sum, f) => sum + f.size, 0);
+    if (totalBytes > MAX_TOTAL_BYTES) {
+      setExtractError(
+        "画像の合計サイズが大きすぎます（4MBまで）。枚数を減らすか、小さい画像を使ってください。"
+      );
+      return;
+    }
+
+    const previews = await Promise.all(accepted.map(readAsDataURL));
+    setImageFiles(nextFiles);
+    setImagePreviews((prev) => [...prev, ...previews]);
+
+    if (picked.length > accepted.length) {
+      setExtractError(
+        `画像は${MAX_IMAGES}枚までです。先頭の${accepted.length}枚だけ追加しました。`
+      );
+    }
   };
 
-  // Geminiで画像から食材を自動抽出
+  // 選んだ画像を1枚取り消す
+  const handleRemoveImage = (index: number) => {
+    setImageFiles((prev) => prev.filter((_, i) => i !== index));
+    setImagePreviews((prev) => prev.filter((_, i) => i !== index));
+    setExtractError("");
+  };
+
+  // Geminiで画像から食材を自動抽出（複数枚は「1つのレシピの分割」として送る）
   const handleGeminiExtract = async () => {
-    if (!imageFile) return;
+    if (imageFiles.length === 0) return;
     setIsExtracting(true);
     setExtractError("");
 
     const formData = new FormData();
-    formData.append("image", imageFile);
+    imageFiles.forEach((file) => formData.append("images", file));
 
     try {
       const res = await fetch("/api/extract-menu", {
@@ -570,8 +615,8 @@ export default function Home() {
 
       setBulkText(data.result);
       setRemaining(data.remaining);
-      setImageFile(null);
-      setImagePreview(null);
+      setImageFiles([]);
+      setImagePreviews([]);
     } catch {
       setExtractError("通信エラーが発生しました。インターネット接続を確認してください。");
     } finally {
@@ -1030,30 +1075,61 @@ ${list}
                     <p style={{ marginTop: "6px", fontSize: "0.85rem" }}>
                       レシピや献立表の写真を選ぶと、メニュー名と食材を自動で読み取ります。
                     </p>
+                    <p style={{ marginTop: "4px", fontSize: "0.8rem", color: "var(--text-light)" }}>
+                      1つのレシピが複数の画像に分かれている場合は、<strong>上から順に</strong>最大{MAX_IMAGES}枚まで選べます。
+                      2枚以上のときは<strong>1つの献立</strong>としてまとめて読み取ります。
+                    </p>
 
-                    {/* 画像アップロードエリア */}
-                    <div
-                      className="image-upload-area"
-                      onClick={() => document.getElementById("imageInput")?.click()}
-                    >
-                      {imagePreview ? (
-                        <img src={imagePreview} alt="選択中の画像" className="image-preview" />
-                      ) : (
+                    {/* 画像アップロードエリア（選択済みはサムネイル、末尾に追加タイル） */}
+                    {imagePreviews.length === 0 ? (
+                      <div
+                        className="image-upload-area"
+                        onClick={() => document.getElementById("imageInput")?.click()}
+                      >
                         <div className="image-upload-placeholder">
                           <span style={{ fontSize: "2rem" }}>📷</span>
                           <span>タップして画像を選択</span>
                         </div>
-                      )}
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="image-thumb-grid">
+                        {imagePreviews.map((src, i) => (
+                          <div key={i} className="image-thumb">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={src} alt={`選択中の画像${i + 1}`} />
+                            <span className="image-thumb-index">{i + 1}</span>
+                            <button
+                              type="button"
+                              className="image-thumb-remove"
+                              onClick={() => handleRemoveImage(i)}
+                              aria-label={`画像${i + 1}を削除`}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                        {imagePreviews.length < MAX_IMAGES && (
+                          <button
+                            type="button"
+                            className="image-thumb-add"
+                            onClick={() => document.getElementById("imageInput")?.click()}
+                          >
+                            <span style={{ fontSize: "1.5rem" }}>＋</span>
+                            <span style={{ fontSize: "0.75rem" }}>追加</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
                     <input
                       id="imageInput"
                       type="file"
                       accept="image/*"
+                      multiple
                       style={{ display: "none" }}
                       onChange={handleImageChange}
                     />
 
-                    {imageFile && (
+                    {imageFiles.length > 0 && (
                       <button
                         type="button"
                         className="btn-primary"
@@ -1061,7 +1137,11 @@ ${list}
                         disabled={isExtracting}
                         style={{ marginTop: "12px" }}
                       >
-                        {isExtracting ? "⏳ AIが読み取り中..." : "✨ Geminiで自動抽出する"}
+                        {isExtracting
+                          ? "⏳ AIが読み取り中..."
+                          : imageFiles.length === 1
+                          ? "✨ Geminiで自動抽出する"
+                          : `✨ ${imageFiles.length}枚を1つの献立として読み取る`}
                       </button>
                     )}
 
