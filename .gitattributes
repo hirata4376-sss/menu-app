@@ -1,0 +1,2 @@
+# Windows のバッチファイルは必ず CRLF で書き出す（cmd.exe が LF を誤解釈するため）
+*.bat text eol=crlf

@@ -1,5 +1,6 @@
 @echo off
-cd /d "C:\Users\heyta\OneDrive\Desktop\作業場\my note\20_Project\Menu_App"
+chcp 65001>nul
+cd /d "%~dp0"
 echo ===== デプロイ開始 ===== > deploy_log.txt
 echo %date% %time% >> deploy_log.txt
 echo. >> deploy_log.txt
